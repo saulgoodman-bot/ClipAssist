@@ -3,10 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-BASE_DIR = Path("data")
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-TMP_DIR = BASE_DIR / "tmp"
+from core.config import OUTPUT_DIR, TMP_DIR, UPLOAD_DIR
 
 
 def ensure_dirs() -> None:
@@ -29,5 +26,6 @@ def cleanup_paths(*paths: str) -> None:
 
 
 def clear_all_local_data() -> None:
-    if BASE_DIR.exists():
-        shutil.rmtree(BASE_DIR)
+    base = UPLOAD_DIR.parent
+    if base.exists():
+        shutil.rmtree(base)
