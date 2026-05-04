@@ -1,0 +1,12 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+sqlmodel==0.0.22
+sqlalchemy==2.0.36
+pydantic==2.9.2
+celery==5.4.0
+redis==5.1.1
+python-multipart==0.0.9
+boto3==1.35.34
+faster-whisper==1.0.3
+openai==1.55.0
+anyio==4.6.2.post1
