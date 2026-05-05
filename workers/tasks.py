@@ -83,6 +83,7 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
 
         _update_video(video_id, progress_stage="rendering")
         for idx, seg in enumerate(selected_clips[:MAX_CLIPS], start=1):
+            stage = "rendering"
             start = float(seg["start"])
             end = float(seg["end"])
             subtitle_items = [
