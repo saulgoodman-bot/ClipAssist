@@ -49,3 +49,8 @@ PYANNOTE_TOKEN: str = os.getenv("PYANNOTE_TOKEN", "")
 MAX_CLIPS: int = int(os.getenv("MAX_CLIPS", "5"))
 MIN_CLIP_SECONDS: int = int(os.getenv("MIN_CLIP_SECONDS", "20"))
 MAX_CLIP_SECONDS: int = int(os.getenv("MAX_CLIP_SECONDS", "90"))
+
+# ── API auth & limits ───────────────────────────────────────────────────────
+JWT_SECRET: str = os.getenv("JWT_SECRET", "change-me")
+MAX_UPLOAD_MB: int = int(os.getenv("MAX_UPLOAD_MB", "500"))
+MAX_DAILY_UPLOADS: int = int(os.getenv("MAX_DAILY_UPLOADS", "10"))

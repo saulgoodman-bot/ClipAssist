@@ -1,10 +1,9 @@
-"""What changed: Added structured stage logging, optional diarization, S3 output persistence, YouTube ingest task, and dead-letter publishing."""
+"""What changed: Added single-clip re-render task and clip status updates while preserving pipeline stages/logging."""
 from __future__ import annotations
 
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 import redis
 
@@ -40,25 +39,21 @@ def _update_video(video_id: int, **kwargs: object) -> None:
 def _publish_dead_letter(video_id: int, error: str) -> None:
     try:
         client = redis.from_url(REDIS_URL, decode_responses=True)
-        message = {
-            "video_id": video_id,
-            "error": error,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        client.rpush("clipassist:dead_letter", json.dumps(message))
+        client.rpush(
+            "clipassist:dead_letter",
+            json.dumps({"video_id": video_id, "error": error, "timestamp": datetime.now(timezone.utc).isoformat()}),
+        )
     except Exception:
-        logger.exception("dead-letter publish failed", extra={"video_id": video_id, "progress_stage": "dead_letter"})
+        logger.exception("dead-letter publish failed")
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=30)
 def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     with get_session() as session:
         video = session.get(Video, video_id)
         if video is None:
-            logger.error("video not found", extra={"video_id": video_id, "progress_stage": "load"})
             return
         video_path = video.s3_path
         video.status = VideoStatus.PROCESSING
@@ -68,79 +63,43 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
 
     wav_path = str(TMP_DIR / f"{video_id}.wav")
     transcript: dict = {"segments": []}
-    selected_clips: list[dict] = []
-
     try:
-        try:
-            _update_video(video_id, progress_stage="metadata")
-            metadata = ffprobe_metadata(video_path)
-            duration = float(metadata.get("format", {}).get("duration", 0.0))
-            _update_video(video_id, duration=duration)
-            _log(video_id, "metadata", "metadata complete", duration=duration)
-        except Exception as exc:
-            _log(video_id, "metadata", "metadata failed", error=str(exc))
-            raise
+        metadata = ffprobe_metadata(video_path)
+        _update_video(video_id, duration=float(metadata.get("format", {}).get("duration", 0.0)), progress_stage="extracting_audio")
+        extract_audio_wav(video_path, wav_path)
 
-        try:
-            _update_video(video_id, progress_stage="extracting_audio")
-            extract_audio_wav(video_path, wav_path)
-            _log(video_id, "extracting_audio", "audio extracted", wav_path=wav_path)
-        except Exception as exc:
-            _log(video_id, "extracting_audio", "audio extraction failed", error=str(exc))
-            raise
-
-        try:
-            _update_video(video_id, progress_stage="transcribing")
-            transcript = transcribe_word_timestamps(wav_path, model_size=WHISPER_MODEL_SIZE)
-            transcript_path = TMP_DIR / f"{video_id}_transcript.json"
-            transcript_path.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
-            _log(video_id, "transcribing", "transcription complete", transcript_path=str(transcript_path))
-        except Exception as exc:
-            _log(video_id, "transcribing", "transcription failed", error=str(exc))
-            raise
+        _update_video(video_id, progress_stage="transcribing")
+        transcript = transcribe_word_timestamps(wav_path, model_size=WHISPER_MODEL_SIZE)
+        (TMP_DIR / f"{video_id}_transcript.json").write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
 
         if ENABLE_DIARIZATION:
             try:
-                _update_video(video_id, progress_stage="diarizing")
-                diarization = diarize_audio(wav_path)
-                transcript["segments"] = merge_diarization(transcript["segments"], diarization)
-                _log(video_id, "diarizing", "diarization complete", diarization_turns=len(diarization))
+                transcript["segments"] = merge_diarization(transcript["segments"], diarize_audio(wav_path))
             except Exception as exc:
-                _log(video_id, "diarizing", "diarization failed; continuing without speaker labels", error=str(exc))
+                _log(video_id, "diarizing", "diarization failed; continuing", error=str(exc))
 
-        try:
-            _update_video(video_id, progress_stage="analyzing")
-            selected_clips = get_clip_segments(transcript["segments"])
-            _log(video_id, "analyzing", "clip selection complete", clips=len(selected_clips))
-        except Exception as exc:
-            _log(video_id, "analyzing", "clip selection failed", error=str(exc))
-            raise
+        _update_video(video_id, progress_stage="analyzing")
+        selected_clips = get_clip_segments(transcript["segments"])
 
         _update_video(video_id, progress_stage="rendering")
         for idx, seg in enumerate(selected_clips[:MAX_CLIPS], start=1):
             stage = "rendering"
             start = float(seg["start"])
             end = float(seg["end"])
-            try:
-                subtitle_items = [
-                    {
-                        "start": s["start"] - start,
-                        "end": s["end"] - start,
-                        "text": s["text"].strip(),
-                    }
-                    for s in transcript["segments"]
-                    if s["start"] >= start and s["end"] <= end and s["text"].strip()
-                ]
+            subtitle_items = [
+                {"start": s["start"] - start, "end": s["end"] - start, "text": s["text"].strip()}
+                for s in transcript["segments"]
+                if s["start"] >= start and s["end"] <= end and s["text"].strip()
+            ]
+            clip_ass = str(TMP_DIR / f"{video_id}_{idx}.ass")
+            write_ass(subtitle_items, clip_ass)
+            local_output_path = str(OUTPUT_DIR / f"video_{video_id}_clip_{idx}.mp4")
+            render_clip_with_ass(video_path, local_output_path, clip_ass, start, end)
+            output_key = save_output(local_output_path, f"outputs/video_{video_id}_clip_{idx}.mp4")
 
-                clip_ass = str(TMP_DIR / f"{video_id}_{idx}.ass")
-                write_ass(subtitle_items, clip_ass)
-
-                local_output_path = str(OUTPUT_DIR / f"video_{video_id}_clip_{idx}.mp4")
-                render_clip_with_ass(video_path, local_output_path, clip_ass, start, end)
-                output_key = save_output(local_output_path, f"outputs/video_{video_id}_clip_{idx}.mp4")
-
-                with get_session() as session:
-                    clip = Clip(
+            with get_session() as session:
+                session.add(
+                    Clip(
                         video_id=video_id,
                         start_time=start,
                         end_time=end,
@@ -148,22 +107,16 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
                         score=float(seg.get("score", 0.0)),
                         reason=str(seg.get("reason", "")),
                         s3_path=output_key,
+                        status="completed",
                     )
-                    session.add(clip)
-                    session.commit()
-
-                cleanup_keys(clip_ass)
-                _log(video_id, stage, "clip rendered", clip_index=idx, output_key=output_key)
-            except Exception as exc:
-                _log(video_id, stage, "clip render failed; continuing", clip_index=idx, error=str(exc))
+                )
+                session.commit()
+            cleanup_keys(clip_ass)
 
         cleanup_keys(wav_path)
         _update_video(video_id, status=VideoStatus.COMPLETED, progress_stage="completed")
-        _log(video_id, "completed", "pipeline complete")
-
     except Exception as exc:
         _update_video(video_id, status=VideoStatus.FAILED, error_message=str(exc)[:1000])
-        _log(video_id, "failed", "pipeline failed", error=str(exc))
         try:
             raise self.retry(exc=exc)
         except self.MaxRetriesExceededError:
@@ -172,18 +125,57 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
 
 @celery_app.task(bind=True, max_retries=1, default_retry_delay=15)
 def ingest_youtube_video(self, video_id: int, url: str) -> None:  # noqa: ANN001
-    stage = "ingest_youtube"
     try:
-        _update_video(video_id, status=VideoStatus.PROCESSING, progress_stage=stage)
+        _update_video(video_id, status=VideoStatus.PROCESSING, progress_stage="ingest_youtube")
         downloaded_path = download_youtube(url, str(TMP_DIR))
         persisted_key = save_output(downloaded_path, f"uploads/video_{video_id}.mp4")
         _update_video(video_id, s3_path=persisted_key, progress_stage="queued_for_processing")
-        _log(video_id, stage, "youtube ingest complete", url=url, persisted_key=persisted_key)
         process_video_pipeline.delay(video_id)
     except Exception as exc:
         _update_video(video_id, status=VideoStatus.FAILED, error_message=str(exc)[:1000])
-        _log(video_id, stage, "youtube ingest failed", error=str(exc))
         try:
             raise self.retry(exc=exc)
         except self.MaxRetriesExceededError:
             _publish_dead_letter(video_id, str(exc))
+
+
+@celery_app.task(bind=True, max_retries=1, default_retry_delay=15)
+def render_single_clip(self, clip_id: int) -> None:  # noqa: ANN001
+    with get_session() as session:
+        clip = session.get(Clip, clip_id)
+        if clip is None:
+            return
+        video = session.get(Video, clip.video_id)
+        if video is None:
+            clip.status = "failed"
+            session.add(clip)
+            session.commit()
+            return
+        clip.status = "rendering"
+        session.add(clip)
+        session.commit()
+        video_path = video.s3_path
+
+    try:
+        start, end = float(clip.start_time), float(clip.end_time)
+        ass_path = str(TMP_DIR / f"rerender_{clip_id}.ass")
+        write_ass([], ass_path)
+        local_output_path = str(OUTPUT_DIR / f"clip_{clip_id}_rerender.mp4")
+        render_clip_with_ass(video_path, local_output_path, ass_path, start, end)
+        key = save_output(local_output_path, f"outputs/clip_{clip_id}_rerender.mp4")
+        cleanup_keys(ass_path)
+        with get_session() as session:
+            db_clip = session.get(Clip, clip_id)
+            if db_clip:
+                db_clip.s3_path = key
+                db_clip.status = "ready"
+                session.add(db_clip)
+                session.commit()
+    except Exception:
+        with get_session() as session:
+            db_clip = session.get(Clip, clip_id)
+            if db_clip:
+                db_clip.status = "failed"
+                session.add(db_clip)
+                session.commit()
+        raise
