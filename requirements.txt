@@ -10,3 +10,9 @@ boto3==1.35.34
 faster-whisper==1.0.3
 openai==1.55.0
 anyio==4.6.2.post1
+yt-dlp==2026.04.22
+pyannote.audio==3.3.2  # optional diarization dependency
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+email-validator==2.2.0
+python-dotenv==1.0.1
