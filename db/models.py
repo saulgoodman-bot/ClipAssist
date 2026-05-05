@@ -1,8 +1,11 @@
+"""What changed: Added Video.updated_at timestamp column for migration-safe status updates."""
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from sqlalchemy import Column, DateTime
 from sqlmodel import Field, SQLModel
 
 
@@ -21,6 +24,10 @@ class Video(SQLModel, table=True):
     status: VideoStatus = Field(default=VideoStatus.PENDING)
     progress_stage: Optional[str] = None
     error_message: Optional[str] = None
+    updated_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        sa_column=Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow),
+    )
 
 
 class Clip(SQLModel, table=True):
