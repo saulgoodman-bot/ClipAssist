@@ -8,18 +8,20 @@ from pathlib import Path
 from typing import Generator
 
 import boto3
-import redis
+from redis import Redis
 from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from sqlmodel import Session, select
 
 from api.auth import create_access_token, get_current_user, hash_password, verify_password
 from api.schemas import (
     AuthResponse,
     ClipResponse,
-    ClipUpdateRequest,
-    IngestUrlRequest,
+    ClipUpdate,
+    IngestURLRequest,
     LoginRequest,
     MeResponse,
     RegisterRequest,
@@ -39,11 +41,18 @@ from core.config import (
 )
 from db.models import Clip, User, Video, VideoStatus
 from db.session import get_session, init_db
-from storage.file_manager import cleanup_keys, get_presigned_url, save_upload
+from storage.file_manager import generate_presigned_url, save_upload
 from workers.tasks import ingest_youtube_video, process_video_pipeline, render_single_clip
 
 app = FastAPI(title="ClipAssist MVP")
-rate_redis = redis.from_url(REDIS_URL, decode_responses=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+rate_redis = Redis.from_url(REDIS_URL, decode_responses=True)
 YOUTUBE_URL_RE = re.compile(r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)", re.IGNORECASE)
 
 
@@ -84,6 +93,23 @@ def _ensure_clip_owner(session: Session, clip_id: int, user: User) -> tuple[Clip
     return clip, video
 
 
+
+
+@app.get("/healthz")
+def healthz(session: Session = Depends(get_db)) -> tuple[dict, int] | dict:
+    redis_ok = True
+    db_ok = True
+    try:
+        Redis.from_url(REDIS_URL).ping()
+    except Exception:
+        redis_ok = False
+    try:
+        session.exec(text("SELECT 1"))
+    except Exception:
+        db_ok = False
+    if redis_ok and db_ok:
+        return {"status": "ok", "redis": True, "db": True}
+    raise HTTPException(status_code=503, detail={"status": "degraded", "redis": redis_ok, "db": db_ok})
 @app.post("/auth/register", response_model=AuthResponse)
 def register(payload: RegisterRequest, session: Session = Depends(get_db)) -> AuthResponse:
     existing = session.exec(select(User).where(User.email == payload.email)).first()
@@ -146,7 +172,7 @@ async def upload_video(
 
 @app.post("/videos/ingest-url", response_model=UploadResponse)
 def ingest_url(
-    payload: IngestUrlRequest,
+    payload: IngestURLRequest,
     session: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> UploadResponse:
@@ -195,17 +221,17 @@ def get_transcript(video_id: int, session: Session = Depends(get_db), current_us
             obj = boto3.client("s3", endpoint_url=S3_ENDPOINT_URL or None).get_object(Bucket=S3_BUCKET, Key=key)
             content = json.loads(obj["Body"].read().decode("utf-8"))
         except Exception:
-            raise HTTPException(status_code=404, detail="Transcript not found")
+            raise HTTPException(status_code=404, detail="Transcript not available yet")
     else:
         if not transcript_path.exists():
-            raise HTTPException(status_code=404, detail="Transcript not found")
+            raise HTTPException(status_code=404, detail="Transcript not available yet")
         content = json.loads(transcript_path.read_text(encoding="utf-8"))
 
     segments = [
         {"start": s["start"], "end": s["end"], "speaker": s.get("speaker"), "text": s.get("text", "")}
         for s in content.get("segments", [])
     ]
-    return TranscriptResponse(video_id=video_id, language=content.get("language", ""), full_text=content.get("text", ""), segments=segments)
+    return TranscriptResponse(video_id=video_id, language=content.get("language", ""), segments=segments)
 
 
 @app.delete("/videos/{video_id}", status_code=204)
@@ -213,15 +239,18 @@ def delete_video(video_id: int, session: Session = Depends(get_db), current_user
     video = _ensure_video_owner(session.get(Video, video_id), current_user)
     clips = session.exec(select(Clip).where(Clip.video_id == video_id)).all()
 
-    cleanup_keys(video.s3_path, *[c.s3_path for c in clips])
-    video.status = VideoStatus.DELETED
+    for path in [video.s3_path, *[c.s3_path for c in clips]]:
+        if path and str(path).startswith("/"):
+            Path(path).unlink(missing_ok=True)
+    video.status = VideoStatus.FAILED
+    video.error_message = "Deleted by user"
     session.add(video)
     session.commit()
     return Response(status_code=204)
 
 
 @app.patch("/clips/{clip_id}", response_model=ClipResponse)
-def patch_clip(clip_id: int, payload: ClipUpdateRequest, session: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> ClipResponse:
+def patch_clip(clip_id: int, payload: ClipUpdate, session: Session = Depends(get_db), current_user: User = Depends(get_current_user)) -> ClipResponse:
     clip, _ = _ensure_clip_owner(session, clip_id, current_user)
 
     if payload.start_time is not None:
@@ -230,14 +259,11 @@ def patch_clip(clip_id: int, payload: ClipUpdateRequest, session: Session = Depe
         clip.end_time = payload.end_time
     if payload.title is not None:
         clip.title = payload.title
-    if payload.layout_mode is not None:
-        clip.layout_mode = payload.layout_mode
+    if payload.reason is not None:
+        clip.reason = payload.reason
 
-    duration = clip.end_time - clip.start_time
-    if duration < 10 or duration > 120:
-        raise HTTPException(status_code=422, detail="clip duration must be between 10 and 120 seconds")
-
-    clip.status = "edited"
+    if clip.end_time <= clip.start_time:
+        raise HTTPException(status_code=422, detail="end_time must be greater than start_time")
     session.add(clip)
     session.commit()
     session.refresh(clip)
@@ -251,7 +277,7 @@ def render_clip(clip_id: int, session: Session = Depends(get_db), current_user: 
     session.add(clip)
     session.commit()
     render_single_clip.delay(clip_id)
-    return RenderResponse(clip_id=clip_id, status="rendering")
+    return RenderResponse(clip_id=clip_id, status="queued")
 
 
 @app.get("/clips/{clip_id}/download")
@@ -265,7 +291,7 @@ def download_clip(clip_id: int, session: Session = Depends(get_db), current_user
             boto3.client("s3", endpoint_url=S3_ENDPOINT_URL or None).head_object(Bucket=S3_BUCKET, Key=clip.s3_path)
         except ClientError:
             raise HTTPException(status_code=404, detail="Clip file not found")
-        return RedirectResponse(get_presigned_url(clip.s3_path), status_code=302)
+        return RedirectResponse(generate_presigned_url(clip.s3_path), status_code=302)
 
     clip_path = Path(clip.s3_path)
     if not clip_path.exists():

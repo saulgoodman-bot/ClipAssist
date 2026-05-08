@@ -38,7 +38,7 @@ class UploadResponse(BaseModel):
     status: str
 
 
-class TranscriptSegmentSchema(BaseModel):
+class TranscriptSegment(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     start: float
     end: float
@@ -50,27 +50,20 @@ class TranscriptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     video_id: int
     language: str
-    full_text: str
-    segments: list[TranscriptSegmentSchema]
+    segments: list[TranscriptSegment]
 
 
-class ClipUpdateRequest(BaseModel):
+class ClipUpdate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     title: Optional[str] = Field(default=None, max_length=120)
-    layout_mode: Optional[str] = None
+    reason: Optional[str] = None
 
     @model_validator(mode="after")
-    def validate_clip_update(self) -> "ClipUpdateRequest":
-        if self.layout_mode is not None and self.layout_mode not in {"center", "speaker", "split"}:
-            raise ValueError("layout_mode must be one of: center, speaker, split")
-
-        if self.start_time is not None and self.end_time is not None:
-            duration = self.end_time - self.start_time
-            if duration < 10 or duration > 120:
-                raise ValueError("clip duration must be between 10 and 120 seconds")
-
+    def validate_clip_update(self) -> "ClipUpdate":
+        if self.start_time is not None and self.end_time is not None and self.end_time <= self.start_time:
+            raise ValueError("end_time must be greater than start_time")
         return self
 
 
@@ -84,7 +77,6 @@ class ClipResponse(BaseModel):
     reason: str
     s3_path: str
     status: str
-    layout_mode: Optional[str] = None
 
 
 class RenderResponse(BaseModel):
@@ -93,7 +85,7 @@ class RenderResponse(BaseModel):
     status: str
 
 
-class IngestUrlRequest(BaseModel):
+class IngestURLRequest(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     url: str
 

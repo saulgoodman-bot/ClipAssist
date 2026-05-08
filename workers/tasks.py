@@ -5,16 +5,16 @@ import json
 import logging
 from datetime import datetime, timezone
 
-import redis
+from redis import Redis
 
 from core.config import ENABLE_DIARIZATION, MAX_CLIPS, OUTPUT_DIR, REDIS_URL, TMP_DIR, WHISPER_MODEL_SIZE
 from core.ingest import download_youtube
 from core.intelligence import get_clip_segments
 from core.media import extract_audio_wav, ffprobe_metadata, render_clip_with_ass, write_ass
-from core.transcription import diarize_audio, merge_diarization, transcribe_word_timestamps
+from core.transcription import merge_transcript_with_diarization, diarize_audio, transcribe_word_timestamps
 from db.models import Clip, Video, VideoStatus
 from db.session import get_session
-from storage.file_manager import cleanup_keys, save_output
+from storage.file_manager import cleanup_paths
 from workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -37,8 +37,9 @@ def _update_video(video_id: int, **kwargs: object) -> None:
 
 
 def _publish_dead_letter(video_id: int, error: str) -> None:
+    """Publish failed payload to dead-letter queue."""
     try:
-        client = redis.from_url(REDIS_URL, decode_responses=True)
+        client = Redis.from_url(REDIS_URL, decode_responses=True)
         client.rpush(
             "clipassist:dead_letter",
             json.dumps({"video_id": video_id, "error": error, "timestamp": datetime.now(timezone.utc).isoformat()}),
@@ -48,7 +49,7 @@ def _publish_dead_letter(video_id: int, error: str) -> None:
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=30)
-def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
+def process_video_pipeline(self, video_id: int, stage: str = "start") -> None:  # noqa: ANN001
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with get_session() as session:
@@ -74,7 +75,7 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
 
         if ENABLE_DIARIZATION:
             try:
-                transcript["segments"] = merge_diarization(transcript["segments"], diarize_audio(wav_path))
+                transcript["segments"] = merge_transcript_with_diarization(transcript["segments"], diarize_audio(wav_path))
             except Exception as exc:
                 _log(video_id, "diarizing", "diarization failed; continuing", error=str(exc))
 
@@ -95,7 +96,7 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
             write_ass(subtitle_items, clip_ass)
             local_output_path = str(OUTPUT_DIR / f"video_{video_id}_clip_{idx}.mp4")
             render_clip_with_ass(video_path, local_output_path, clip_ass, start, end)
-            output_key = save_output(local_output_path, f"outputs/video_{video_id}_clip_{idx}.mp4")
+            output_key = local_output_path
 
             with get_session() as session:
                 session.add(
@@ -111,9 +112,9 @@ def process_video_pipeline(self, video_id: int) -> None:  # noqa: ANN001
                     )
                 )
                 session.commit()
-            cleanup_keys(clip_ass)
+            cleanup_paths(clip_ass)
 
-        cleanup_keys(wav_path)
+        cleanup_paths(wav_path)
         _update_video(video_id, status=VideoStatus.COMPLETED, progress_stage="completed")
     except Exception as exc:
         _update_video(video_id, status=VideoStatus.FAILED, error_message=str(exc)[:1000])
@@ -128,7 +129,7 @@ def ingest_youtube_video(self, video_id: int, url: str) -> None:  # noqa: ANN001
     try:
         _update_video(video_id, status=VideoStatus.PROCESSING, progress_stage="ingest_youtube")
         downloaded_path = download_youtube(url, str(TMP_DIR))
-        persisted_key = save_output(downloaded_path, f"uploads/video_{video_id}.mp4")
+        persisted_key = downloaded_path
         _update_video(video_id, s3_path=persisted_key, progress_stage="queued_for_processing")
         process_video_pipeline.delay(video_id)
     except Exception as exc:
@@ -162,8 +163,8 @@ def render_single_clip(self, clip_id: int) -> None:  # noqa: ANN001
         write_ass([], ass_path)
         local_output_path = str(OUTPUT_DIR / f"clip_{clip_id}_rerender.mp4")
         render_clip_with_ass(video_path, local_output_path, ass_path, start, end)
-        key = save_output(local_output_path, f"outputs/clip_{clip_id}_rerender.mp4")
-        cleanup_keys(ass_path)
+        key = local_output_path
+        cleanup_paths(ass_path)
         with get_session() as session:
             db_clip = session.get(Clip, clip_id)
             if db_clip:
